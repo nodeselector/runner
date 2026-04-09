@@ -42,6 +42,14 @@ namespace GitHub.Runner.Worker
             ArgUtil.NotNull(message.Steps, nameof(message.Steps));
             Trace.Info("Job ID {0}", message.JobId);
 
+            // If the message carries lockfile dependencies as a first-class field,
+            // inject them as a variable so the enforcement code can read them uniformly.
+            if (message.Dependencies != null && message.Dependencies.Count > 0)
+            {
+                var depsJson = StringUtil.ConvertToJson(message.Dependencies);
+                message.Variables["system.actions.dependencies"] = new VariableValue(depsJson);
+            }
+
             DateTime jobStartTimeUtc = DateTime.UtcNow;
             _runnerSettings = HostContext.GetService<IConfigurationStore>().GetSettings();
             IRunnerService server = null;
