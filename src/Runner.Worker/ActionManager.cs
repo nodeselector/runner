@@ -66,6 +66,11 @@ namespace GitHub.Runner.Worker
         private readonly Dictionary<Guid, Stack<Pipelines.ActionStep>> _cachedEmbeddedPostSteps = new();
         public Dictionary<Guid, Stack<Pipelines.ActionStep>> CachedEmbeddedPostSteps => _cachedEmbeddedPostSteps;
 
+        private Dictionary<string, string> _dependencyPins = new(DependencyPinKeyComparer.Instance);
+        private readonly Dictionary<string, string> _pinnedOriginalRefs = new(DependencyPinKeyComparer.Instance);
+        private readonly Dictionary<Guid, List<Pipelines.ActionStep>> _cachedPinnedCompositeSteps = new();
+        private bool _useDependencyPins;
+
         public async Task<PrepareResult> PrepareActionsAsync(IExecutionContext executionContext, IEnumerable<Pipelines.JobStep> steps, Guid rootStepId = default(Guid))
         {
             // Assert inputs
@@ -109,6 +114,18 @@ namespace GitHub.Runner.Worker
             }
             IEnumerable<Pipelines.ActionStep> actions = steps.OfType<Pipelines.ActionStep>();
             executionContext.Output("Prepare all required actions");
+
+            // Lockfile dependency pinning: override action refs with pinned SHAs.
+            // When enabled, pins are applied and enforcement is always on — missing pins fail the job.
+            _useDependencyPins = executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.UseDependencyPins) ?? true; // TODO: flip to false before merge
+            _dependencyPins = _useDependencyPins ? BuildDependencyPinMap(executionContext) : new(StringComparer.OrdinalIgnoreCase);
+            if (_dependencyPins.Count > 0)
+            {
+                var enforcement = _useDependencyPins ? " [only pinned dependencies allowed]" : "";
+                executionContext.Output($"Dependency pinning enabled{enforcement}");
+            }
+            ApplyDependencyPins(executionContext, actions, _dependencyPins);
+
             PrepareActionsState result = new PrepareActionsState();
             try
             {
@@ -282,6 +299,17 @@ namespace GitHub.Runner.Worker
                         .Where(x => x.action.Reference.Type == Pipelines.ActionSourceType.Repository)
                         .Select(x => x.action)
                         .ToList();
+
+                    // Apply lockfile pins to sub-actions discovered in composites
+                    ApplyDependencyPins(executionContext, nextLevelRepoActions, _dependencyPins);
+
+                    // Cache the pinned step objects so LoadAction can reuse them
+                    // instead of re-parsing action.yml (which has unpinned refs).
+                    foreach (var group in nextLevel.GroupBy(x => x.parentId))
+                    {
+                        _cachedPinnedCompositeSteps[group.Key] = group.Select(x => x.action).ToList();
+                    }
+
                     await ResolveNewActionsAsync(executionContext, nextLevelRepoActions, resolvedDownloadInfos);
 
                     foreach (var group in nextLevel.GroupBy(x => x.parentId))
@@ -449,6 +477,9 @@ namespace GitHub.Runner.Worker
                     }
                     else if (setupInfo != null && setupInfo.Steps != null && setupInfo.Steps.Count > 0)
                     {
+                        // Apply lockfile pins to sub-actions discovered in composites
+                        ApplyDependencyPins(executionContext, setupInfo.Steps.OfType<Pipelines.ActionStep>(), _dependencyPins);
+                        _cachedPinnedCompositeSteps[action.Id] = setupInfo.Steps.OfType<Pipelines.ActionStep>().ToList();
                         state = await PrepareActionsRecursiveLegacyAsync(executionContext, state, setupInfo.Steps, depth + 1, action.Id);
                     }
                     var repoAction = action.Reference as Pipelines.RepositoryPathReference;
@@ -668,6 +699,13 @@ namespace GitHub.Runner.Worker
                         Trace.Verbose($"Details: {StringUtil.ConvertToJson(compositeAction?.Steps)}");
                         Trace.Info($"Load: {compositeAction.Outputs?.Count ?? 0} number of outputs");
                         Trace.Info($"Details: {StringUtil.ConvertToJson(compositeAction?.Outputs)}");
+
+                        // Use cached pinned steps from prepare time instead of the
+                        // freshly-parsed ones (which have unpinned refs from disk YAML).
+                        if (_cachedPinnedCompositeSteps.TryGetValue(action.Id, out var pinnedSteps))
+                        {
+                            compositeAction.Steps = pinnedSteps;
+                        }
 
                         if (CachedEmbeddedPreSteps.TryGetValue(action.Id, out var preSteps))
                         {
@@ -1012,7 +1050,15 @@ namespace GitHub.Runner.Worker
                 }
                 else
                 {
-                    executionContext.Output($"Download action repository '{downloadInfo.NameWithOwner}@{downloadInfo.Ref}' (SHA:{downloadInfo.ResolvedSha})");
+                    var pinKey = $"{downloadInfo.NameWithOwner}@{downloadInfo.Ref}";
+                    if (_pinnedOriginalRefs.TryGetValue(pinKey, out var originalRef))
+                    {
+                        executionContext.Output($"Download action repository '{downloadInfo.NameWithOwner}@{originalRef}' (SHA:{downloadInfo.ResolvedSha})");
+                    }
+                    else
+                    {
+                        executionContext.Output($"Download action repository '{downloadInfo.NameWithOwner}@{downloadInfo.Ref}' (SHA:{downloadInfo.ResolvedSha})");
+                    }
                 }
             }
 
@@ -1367,6 +1413,144 @@ namespace GitHub.Runner.Worker
             return $"{repositoryReference.Name}@{repositoryReference.Ref}";
         }
 
+        /// <summary>
+        /// Parse the dependencies list from the job message into a lookup keyed by "owner/repo@ref" -> "sha".
+        /// Dependency format: github.com/{owner}/{repo}@{ref}:{algorithm}-{hash}
+        /// </summary>
+        private Dictionary<string, string> BuildDependencyPinMap(IExecutionContext executionContext)
+        {
+            var pins = new Dictionary<string, string>(DependencyPinKeyComparer.Instance);
+
+            var dependencies = executionContext.Global.ActionsDependencies;
+            if (dependencies == null || dependencies.Count == 0)
+            {
+                return pins;
+            }
+
+            foreach (var dep in dependencies)
+            {
+                // Expected format: github.com/actions/checkout@v4:sha1-34e114876b0b11c390a56381ad16ebd13914f8d5
+                if (!TryParseDependencyPin(dep, out var nameWithOwner, out var refValue, out var sha))
+                {
+                    Trace.Warning($"Skipping malformed dependency entry: {dep}");
+                    continue;
+                }
+
+                var key = $"{nameWithOwner}@{refValue}";
+                if (pins.TryGetValue(key, out var existingSha))
+                {
+                    if (!string.Equals(existingSha, sha, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new DependencyPinException(
+                            $"Conflicting dependency pins for '{key}': '{existingSha}' vs '{sha}'. " +
+                            $"Each action must have exactly one pinned SHA.");
+                    }
+
+                    continue;
+                }
+
+                pins[key] = sha;
+                Trace.Info($"Dependency pin: {key} -> {sha}");
+            }
+
+            return pins;
+        }
+
+        /// <summary>
+        /// Parse a dependency string like "github.com/actions/checkout@v4:sha1-abc123" into its components.
+        /// </summary>
+        internal static bool TryParseDependencyPin(string dependency, out string nameWithOwner, out string refValue, out string sha)
+        {
+            nameWithOwner = null;
+            refValue = null;
+            sha = null;
+
+            if (string.IsNullOrEmpty(dependency))
+            {
+                return false;
+            }
+
+            // Strip "github.com/" prefix
+            const string prefix = "github.com/";
+            if (!dependency.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            var remainder = dependency.Substring(prefix.Length);
+
+            // Split on ":" to separate "owner/repo@ref" from "algorithm-hash"
+            var colonIndex = remainder.IndexOf(':');
+            if (colonIndex < 0)
+            {
+                return false;
+            }
+
+            var nameAndRef = remainder.Substring(0, colonIndex);
+            var algorithmAndHash = remainder.Substring(colonIndex + 1);
+
+            // Split nameAndRef on "@" to get owner/repo and ref
+            var atIndex = nameAndRef.IndexOf('@');
+            if (atIndex < 0)
+            {
+                return false;
+            }
+
+            nameWithOwner = nameAndRef.Substring(0, atIndex);
+            refValue = nameAndRef.Substring(atIndex + 1);
+
+            // Require non-empty algorithm prefix (e.g. "sha1-" or "sha256-") and strip it to get bare hash
+            var dashIndex = algorithmAndHash.IndexOf('-');
+            if (dashIndex <= 0)
+            {
+                return false;
+            }
+            sha = algorithmAndHash.Substring(dashIndex + 1);
+
+            return !string.IsNullOrEmpty(nameWithOwner) && !string.IsNullOrEmpty(refValue) && !string.IsNullOrEmpty(sha);
+        }
+
+        /// <summary>
+        /// Override action refs with pinned SHAs from the dependency map.
+        /// </summary>
+        private void ApplyDependencyPins(IExecutionContext executionContext, IEnumerable<Pipelines.ActionStep> actions, Dictionary<string, string> pins)
+        {
+            foreach (var action in actions)
+            {
+                if (action.Reference.Type != Pipelines.ActionSourceType.Repository)
+                {
+                    continue;
+                }
+
+                var repoRef = action.Reference as Pipelines.RepositoryPathReference;
+                if (repoRef == null || string.IsNullOrEmpty(repoRef.Name) || string.IsNullOrEmpty(repoRef.Ref))
+                {
+                    continue;
+                }
+
+                if (string.Equals(repoRef.RepositoryType, Pipelines.PipelineConstants.SelfAlias, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var nameWithPath = string.IsNullOrEmpty(repoRef.Path) ? repoRef.Name : $"{repoRef.Name}/{repoRef.Path}";
+                var key = $"{nameWithPath}@{repoRef.Ref}";
+                if (pins.TryGetValue(key, out var pinnedSha))
+                {
+                    Trace.Info($"Pinning action {nameWithPath}@{repoRef.Ref} -> {pinnedSha}");
+                    _pinnedOriginalRefs[$"{nameWithPath}@{pinnedSha}"] = repoRef.Ref;
+                    repoRef.Ref = pinnedSha;
+                }
+                else if (_useDependencyPins)
+                {
+                    // Enforcement will normally happen further upstream (run-service/launch) before
+                    // the job is dispatched. This is a runner-side safeguard to catch any gaps.
+                    throw new DependencyPinException(
+                        $"Dependency enforcement is enabled but action '{nameWithPath}@{repoRef.Ref}' has no matching lockfile entry. " +
+                        $"Add it to the workflow's dependencies block or disable enforcement.");
+                }
+            }
+        }
+
         private AuthenticationHeaderValue CreateAuthHeader(IExecutionContext executionContext, string downloadUrl, string token)
         {
             if (string.IsNullOrEmpty(token))
@@ -1665,5 +1849,45 @@ namespace GitHub.Runner.Worker
         public Dictionary<string, List<Guid>> ImagesToBuild;
         public Dictionary<string, ActionContainer> ImagesToBuildInfo;
         public Dictionary<Guid, IActionRunner> PreStepTracker;
+    }
+
+    /// <summary>
+    /// Comparer for dependency pin keys ("owner/repo@ref" or "owner/repo/path@ref").
+    /// Case-insensitive on the owner/repo/path portion, case-sensitive (ordinal) on the ref.
+    /// </summary>
+    internal sealed class DependencyPinKeyComparer : IEqualityComparer<string>
+    {
+        public static readonly DependencyPinKeyComparer Instance = new();
+
+        public bool Equals(string x, string y)
+        {
+            if (ReferenceEquals(x, y)) return true;
+            if (x == null || y == null) return false;
+
+            var atX = x.LastIndexOf('@');
+            var atY = y.LastIndexOf('@');
+            if (atX < 0 || atY < 0)
+            {
+                return string.Equals(x, y, StringComparison.OrdinalIgnoreCase);
+            }
+
+            return string.Equals(x.Substring(0, atX), y.Substring(0, atY), StringComparison.OrdinalIgnoreCase)
+                && string.Equals(x.Substring(atX), y.Substring(atY), StringComparison.Ordinal);
+        }
+
+        public int GetHashCode(string obj)
+        {
+            if (obj == null) return 0;
+
+            var at = obj.LastIndexOf('@');
+            if (at < 0)
+            {
+                return StringComparer.OrdinalIgnoreCase.GetHashCode(obj);
+            }
+
+            return HashCode.Combine(
+                StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Substring(0, at)),
+                StringComparer.Ordinal.GetHashCode(obj.Substring(at)));
+        }
     }
 }

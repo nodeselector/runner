@@ -3164,7 +3164,11 @@ runs:
             _ec.Setup(x => x.Global).Returns(new GlobalContext());
             _ec.Setup(x => x.CancellationToken).Returns(_ecTokenSource.Token);
             _ec.Setup(x => x.Root).Returns(new GitHub.Runner.Worker.ExecutionContext());
-            var variables = new Dictionary<string, VariableValue>();
+            var variables = new Dictionary<string, VariableValue>()
+            {
+                // Disable lockfile dependency pinning for pre-existing tests
+                { Constants.Runner.Features.UseDependencyPins, new VariableValue("false") }
+            };
             _ec.Object.Global.Variables = new Variables(_hc, variables);
             _ec.Setup(x => x.ExpressionValues).Returns(new DictionaryContextData());
             _ec.Setup(x => x.ExpressionFunctions).Returns(new List<IFunctionInfo>());
@@ -3282,6 +3286,563 @@ runs:
             {
                 Directory.Delete(_workFolder, recursive: true);
             }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void TryParseDependencyPin_ValidEntry()
+        {
+            var result = ActionManager.TryParseDependencyPin(
+                "github.com/actions/checkout@v4:sha1-34e114876b0b11c390a56381ad16ebd13914f8d5",
+                out var name, out var refValue, out var sha);
+
+            Assert.True(result);
+            Assert.Equal("actions/checkout", name);
+            Assert.Equal("v4", refValue);
+            Assert.Equal("34e114876b0b11c390a56381ad16ebd13914f8d5", sha);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void TryParseDependencyPin_Sha256Entry()
+        {
+            var result = ActionManager.TryParseDependencyPin(
+                "github.com/actions/setup-node@v4:sha256-abc123def456",
+                out var name, out var refValue, out var sha);
+
+            Assert.True(result);
+            Assert.Equal("actions/setup-node", name);
+            Assert.Equal("v4", refValue);
+            Assert.Equal("abc123def456", sha);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void TryParseDependencyPin_MissingPrefix()
+        {
+            var result = ActionManager.TryParseDependencyPin(
+                "actions/checkout@v4:sha1-abc",
+                out _, out _, out _);
+
+            Assert.False(result);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void TryParseDependencyPin_MissingColon()
+        {
+            var result = ActionManager.TryParseDependencyPin(
+                "github.com/actions/checkout@v4",
+                out _, out _, out _);
+
+            Assert.False(result);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void TryParseDependencyPin_EmptyString()
+        {
+            var result = ActionManager.TryParseDependencyPin(
+                "",
+                out _, out _, out _);
+
+            Assert.False(result);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void TryParseDependencyPin_NullString()
+        {
+            var result = ActionManager.TryParseDependencyPin(
+                null,
+                out _, out _, out _);
+
+            Assert.False(result);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void TryParseDependencyPin_MissingAlgorithmPrefix()
+        {
+            // Hash without algorithm-dash prefix should be rejected
+            var result = ActionManager.TryParseDependencyPin(
+                "github.com/actions/checkout@v4:abc123noprefixhere",
+                out _, out _, out _);
+
+            Assert.False(result);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void BuildDependencyPinMap_ValidEntries()
+        {
+            var (actionManager, hc) = CreateActionManagerForTest();
+
+            var executionContext = CreateTestExecutionContext(hc,
+                dependencies: new List<string>
+                {
+                    "github.com/actions/checkout@v4:sha1-34e114876b0b11c390a56381ad16ebd13914f8d5",
+                    "github.com/actions/setup-node@v4:sha256-abc123"
+                },
+                usePins: true);
+
+            // Use reflection to call the private method
+            var method = typeof(ActionManager).GetMethod("BuildDependencyPinMap",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var pins = (Dictionary<string, string>)method.Invoke(actionManager, new object[] { executionContext });
+
+            Assert.Equal(2, pins.Count);
+            Assert.Equal("34e114876b0b11c390a56381ad16ebd13914f8d5", pins["actions/checkout@v4"]);
+            Assert.Equal("abc123", pins["actions/setup-node@v4"]);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void BuildDependencyPinMap_SkipsMalformed()
+        {
+            var (actionManager, hc) = CreateActionManagerForTest();
+
+            var executionContext = CreateTestExecutionContext(hc,
+                dependencies: new List<string>
+                {
+                    "github.com/actions/checkout@v4:sha1-abc",
+                    "garbage",
+                    "github.com/actions/setup-node@v4:sha1-def"
+                },
+                usePins: true);
+
+            var method = typeof(ActionManager).GetMethod("BuildDependencyPinMap",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var pins = (Dictionary<string, string>)method.Invoke(actionManager, new object[] { executionContext });
+
+            Assert.Equal(2, pins.Count);
+            Assert.True(pins.ContainsKey("actions/checkout@v4"));
+            Assert.True(pins.ContainsKey("actions/setup-node@v4"));
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void ApplyDependencyPins_EnforcementThrowsOnMissingPin()
+        {
+            var (actionManager, hc) = CreateActionManagerForTest();
+
+            // Set up enforcement via reflection
+            var enforcementField = typeof(ActionManager).GetField("_useDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            enforcementField.SetValue(actionManager, true);
+
+            var pinsField = typeof(ActionManager).GetField("_dependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            pinsField.SetValue(actionManager, new Dictionary<string, string>(DependencyPinKeyComparer.Instance));
+
+            var executionContext = CreateTestExecutionContext(hc, dependencies: null, usePins: true);
+
+            var action = new Pipelines.ActionStep()
+            {
+                Name = "checkout",
+                Reference = new Pipelines.RepositoryPathReference()
+                {
+                    Name = "actions/checkout",
+                    Ref = "v4",
+                    RepositoryType = "GitHub"
+                }
+            };
+
+            var method = typeof(ActionManager).GetMethod("ApplyDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            var ex = Assert.Throws<System.Reflection.TargetInvocationException>(() =>
+                method.Invoke(actionManager, new object[] { executionContext, new List<Pipelines.ActionStep> { action }, new Dictionary<string, string>(DependencyPinKeyComparer.Instance) }));
+
+            Assert.IsType<DependencyPinException>(ex.InnerException);
+            Assert.Contains("no matching lockfile entry", ex.InnerException.Message);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void ApplyDependencyPins_MutatesRef()
+        {
+            var (actionManager, hc) = CreateActionManagerForTest();
+
+            var enforcementField = typeof(ActionManager).GetField("_useDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            enforcementField.SetValue(actionManager, false);
+
+            var executionContext = CreateTestExecutionContext(hc, dependencies: null, usePins: true);
+
+            var action = new Pipelines.ActionStep()
+            {
+                Name = "checkout",
+                Reference = new Pipelines.RepositoryPathReference()
+                {
+                    Name = "actions/checkout",
+                    Ref = "v4",
+                    RepositoryType = "GitHub"
+                }
+            };
+
+            var pins = new Dictionary<string, string>(DependencyPinKeyComparer.Instance)
+            {
+                { "actions/checkout@v4", "abc123sha" }
+            };
+
+            var method = typeof(ActionManager).GetMethod("ApplyDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            method.Invoke(actionManager, new object[] { executionContext, new List<Pipelines.ActionStep> { action }, pins });
+
+            var repoRef = action.Reference as Pipelines.RepositoryPathReference;
+            Assert.Equal("abc123sha", repoRef.Ref);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void ApplyDependencyPins_NoEnforcementSkipsMissing()
+        {
+            var (actionManager, hc) = CreateActionManagerForTest();
+
+            var enforcementField = typeof(ActionManager).GetField("_useDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            enforcementField.SetValue(actionManager, false);
+
+            var executionContext = CreateTestExecutionContext(hc, dependencies: null, usePins: true);
+
+            var action = new Pipelines.ActionStep()
+            {
+                Name = "checkout",
+                Reference = new Pipelines.RepositoryPathReference()
+                {
+                    Name = "actions/checkout",
+                    Ref = "v4",
+                    RepositoryType = "GitHub"
+                }
+            };
+
+            var method = typeof(ActionManager).GetMethod("ApplyDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            // Should NOT throw — no enforcement, no matching pin, ref stays unchanged
+            method.Invoke(actionManager, new object[] { executionContext, new List<Pipelines.ActionStep> { action }, new Dictionary<string, string>(DependencyPinKeyComparer.Instance) });
+
+            var repoRef = action.Reference as Pipelines.RepositoryPathReference;
+            Assert.Equal("v4", repoRef.Ref);
+        }
+
+        /// <summary>
+        /// Helper to create a minimal IExecutionContext with dependency-related setup.
+        /// </summary>
+        private IExecutionContext CreateTestExecutionContext(TestHostContext hc, IList<string> dependencies, bool usePins)
+        {
+            var executionContext = new Mock<IExecutionContext>();
+            var variables = new Variables(hc, new Dictionary<string, VariableValue>
+            {
+                { Constants.Runner.Features.UseDependencyPins, new VariableValue(usePins.ToString()) }
+            });
+            var globalContext = new GlobalContext();
+            globalContext.Variables = variables;
+            globalContext.ActionsDependencies = dependencies;
+            executionContext.Setup(x => x.Global).Returns(globalContext);
+            executionContext.Setup(x => x.Write(It.IsAny<string>(), It.IsAny<string>()));
+            return executionContext.Object;
+        }
+
+        // ── TryParseDependencyPin: empty algorithm name ──
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void TryParseDependencyPin_EmptyAlgorithmName()
+        {
+            // ":-hash" has a dash at index 0 — algorithm name is empty, should be rejected
+            var result = ActionManager.TryParseDependencyPin(
+                "github.com/actions/checkout@v4:-abc123",
+                out _, out _, out _);
+
+            Assert.False(result);
+        }
+
+        // ── TryParseDependencyPin: subdirectory actions ──
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void TryParseDependencyPin_SubdirectoryAction()
+        {
+            var result = ActionManager.TryParseDependencyPin(
+                "github.com/azure/login/subdir@v2:sha1-aabbccdd",
+                out var name, out var refValue, out var sha);
+
+            Assert.True(result);
+            Assert.Equal("azure/login/subdir", name);
+            Assert.Equal("v2", refValue);
+            Assert.Equal("aabbccdd", sha);
+        }
+
+        // ── BuildDependencyPinMap: duplicate pins ──
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void BuildDependencyPinMap_DuplicateSameSha()
+        {
+            var (actionManager, hc) = CreateActionManagerForTest();
+
+            var executionContext = CreateTestExecutionContext(hc,
+                dependencies: new List<string>
+                {
+                    "github.com/actions/checkout@v4:sha1-abc123",
+                    "github.com/actions/checkout@v4:sha1-abc123"
+                },
+                usePins: true);
+
+            var method = typeof(ActionManager).GetMethod("BuildDependencyPinMap",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            // Same key, same SHA — should dedup silently, not throw
+            var pins = (Dictionary<string, string>)method.Invoke(actionManager, new object[] { executionContext });
+            Assert.Single(pins);
+            Assert.Equal("abc123", pins["actions/checkout@v4"]);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void BuildDependencyPinMap_DuplicateConflictingSha()
+        {
+            var (actionManager, hc) = CreateActionManagerForTest();
+
+            var executionContext = CreateTestExecutionContext(hc,
+                dependencies: new List<string>
+                {
+                    "github.com/actions/checkout@v4:sha1-abc123",
+                    "github.com/actions/checkout@v4:sha1-def456"
+                },
+                usePins: true);
+
+            var method = typeof(ActionManager).GetMethod("BuildDependencyPinMap",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            var ex = Assert.Throws<System.Reflection.TargetInvocationException>(() =>
+                method.Invoke(actionManager, new object[] { executionContext }));
+
+            Assert.IsType<DependencyPinException>(ex.InnerException);
+            Assert.Contains("Conflicting dependency pins", ex.InnerException.Message);
+        }
+
+        // ── ApplyDependencyPins: subdirectory action key matches correctly ──
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void ApplyDependencyPins_SubdirectoryActionMatchesPin()
+        {
+            var (actionManager, hc) = CreateActionManagerForTest();
+
+            var enforcementField = typeof(ActionManager).GetField("_useDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            enforcementField.SetValue(actionManager, false);
+
+            var executionContext = CreateTestExecutionContext(hc, dependencies: null, usePins: true);
+
+            var action = new Pipelines.ActionStep()
+            {
+                Name = "checkout",
+                Reference = new Pipelines.RepositoryPathReference()
+                {
+                    Name = "azure/login",
+                    Path = "subdir",
+                    Ref = "v2",
+                    RepositoryType = "GitHub"
+                }
+            };
+
+            var pins = new Dictionary<string, string>(DependencyPinKeyComparer.Instance)
+            {
+                { "azure/login/subdir@v2", "pinned-sha-123" }
+            };
+
+            var method = typeof(ActionManager).GetMethod("ApplyDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            method.Invoke(actionManager, new object[] { executionContext, new List<Pipelines.ActionStep> { action }, pins });
+
+            var repoRef = action.Reference as Pipelines.RepositoryPathReference;
+            Assert.Equal("pinned-sha-123", repoRef.Ref);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void ApplyDependencyPins_SubdirectoryActionDoesNotMatchRepoOnlyPin()
+        {
+            var (actionManager, hc) = CreateActionManagerForTest();
+
+            var enforcementField = typeof(ActionManager).GetField("_useDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            enforcementField.SetValue(actionManager, false);
+
+            var executionContext = CreateTestExecutionContext(hc, dependencies: null, usePins: true);
+
+            var action = new Pipelines.ActionStep()
+            {
+                Name = "checkout",
+                Reference = new Pipelines.RepositoryPathReference()
+                {
+                    Name = "azure/login",
+                    Path = "subdir",
+                    Ref = "v2",
+                    RepositoryType = "GitHub"
+                }
+            };
+
+            // Pin is for azure/login@v2 (no path) — should NOT match azure/login/subdir@v2
+            var pins = new Dictionary<string, string>(DependencyPinKeyComparer.Instance)
+            {
+                { "azure/login@v2", "pinned-sha-123" }
+            };
+
+            var method = typeof(ActionManager).GetMethod("ApplyDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            method.Invoke(actionManager, new object[] { executionContext, new List<Pipelines.ActionStep> { action }, pins });
+
+            var repoRef = action.Reference as Pipelines.RepositoryPathReference;
+            // Ref should be unchanged — no matching pin
+            Assert.Equal("v2", repoRef.Ref);
+        }
+
+        // ── ApplyDependencyPins: _pinnedOriginalRefs stores path-qualified key ──
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void ApplyDependencyPins_PinnedOriginalRefsIncludesPath()
+        {
+            var (actionManager, hc) = CreateActionManagerForTest();
+
+            var enforcementField = typeof(ActionManager).GetField("_useDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            enforcementField.SetValue(actionManager, false);
+
+            var executionContext = CreateTestExecutionContext(hc, dependencies: null, usePins: true);
+
+            var action = new Pipelines.ActionStep()
+            {
+                Name = "checkout",
+                Reference = new Pipelines.RepositoryPathReference()
+                {
+                    Name = "azure/login",
+                    Path = "subdir",
+                    Ref = "v2",
+                    RepositoryType = "GitHub"
+                }
+            };
+
+            var pins = new Dictionary<string, string>(DependencyPinKeyComparer.Instance)
+            {
+                { "azure/login/subdir@v2", "pinned-sha-456" }
+            };
+
+            var method = typeof(ActionManager).GetMethod("ApplyDependencyPins",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            method.Invoke(actionManager, new object[] { executionContext, new List<Pipelines.ActionStep> { action }, pins });
+
+            // Verify _pinnedOriginalRefs was stored with the path-qualified key
+            var pinnedRefsField = typeof(ActionManager).GetField("_pinnedOriginalRefs",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var pinnedRefs = (Dictionary<string, string>)pinnedRefsField.GetValue(actionManager);
+
+            Assert.True(pinnedRefs.ContainsKey("azure/login/subdir@pinned-sha-456"));
+            Assert.Equal("v2", pinnedRefs["azure/login/subdir@pinned-sha-456"]);
+        }
+
+        // ── DependencyPinKeyComparer: case sensitivity ──
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void DependencyPinKeyComparer_OwnerRepoCaseInsensitive()
+        {
+            var comparer = DependencyPinKeyComparer.Instance;
+
+            // owner/repo portion is case-insensitive
+            Assert.True(comparer.Equals("Actions/Checkout@v4", "actions/checkout@v4"));
+            Assert.Equal(comparer.GetHashCode("Actions/Checkout@v4"), comparer.GetHashCode("actions/checkout@v4"));
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void DependencyPinKeyComparer_RefCaseSensitive()
+        {
+            var comparer = DependencyPinKeyComparer.Instance;
+
+            // ref portion is case-sensitive — v4 ≠ V4
+            Assert.False(comparer.Equals("actions/checkout@v4", "actions/checkout@V4"));
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void DependencyPinKeyComparer_FullMatchCaseInsensitiveOwner()
+        {
+            var comparer = DependencyPinKeyComparer.Instance;
+
+            // Mixed case owner with same ref
+            Assert.True(comparer.Equals("Azure/Login/subdir@v2", "azure/login/subdir@v2"));
+            Assert.Equal(comparer.GetHashCode("Azure/Login/subdir@v2"), comparer.GetHashCode("azure/login/subdir@v2"));
+
+            // Same owner different ref case
+            Assert.False(comparer.Equals("azure/login@Release-v1", "azure/login@release-v1"));
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void DependencyPinKeyComparer_DictionaryLookupRespectsCasing()
+        {
+            var dict = new Dictionary<string, string>(DependencyPinKeyComparer.Instance)
+            {
+                { "actions/checkout@v4", "sha-abc" }
+            };
+
+            // Case-insensitive owner matches
+            Assert.True(dict.ContainsKey("Actions/Checkout@v4"));
+
+            // Case-sensitive ref does NOT match
+            Assert.False(dict.ContainsKey("actions/checkout@V4"));
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void DependencyPinKeyComparer_NoAtSignFallsBack()
+        {
+            var comparer = DependencyPinKeyComparer.Instance;
+
+            // Keys with no @ sign fall back to full case-insensitive comparison
+            Assert.True(comparer.Equals("actions/checkout", "Actions/Checkout"));
+            Assert.False(comparer.Equals("actions/checkout", "actions/setup-node"));
+        }
+
+        /// <summary>
+        /// Helper to create ActionManager with a fresh TestHostContext for unit tests.
+        /// </summary>
+        private (ActionManager manager, TestHostContext hc) CreateActionManagerForTest([CallerMemberName] string name = "")
+        {
+            var hc = new TestHostContext(this, name);
+            var actionManager = new ActionManager();
+            actionManager.Initialize(hc);
+            return (actionManager, hc);
         }
     }
 }

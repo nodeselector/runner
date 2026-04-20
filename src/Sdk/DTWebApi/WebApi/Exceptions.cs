@@ -2593,4 +2593,23 @@ namespace GitHub.DistributedTask.WebApi
         {
         }
     }
+
+    [Serializable]
+    public sealed class DependencyPinException : DistributedTaskException
+    {
+        public DependencyPinException(String message)
+            : base(message)
+        {
+        }
+
+        public DependencyPinException(String message, Exception innerException)
+            : base(message, innerException)
+        {
+        }
+
+        private DependencyPinException(SerializationInfo info, StreamingContext context)
+            : base(info, context)
+        {
+        }
+    }
 }

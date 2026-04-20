@@ -179,6 +179,12 @@ namespace GitHub.Runner.Common
                 public static readonly string EmitCompositeMarkers = "actions_runner_emit_composite_markers";
                 public static readonly string BatchActionResolution = "actions_batch_action_resolution";
                 public static readonly string UseBearerTokenForCodeload = "actions_use_bearer_token_for_codeload";
+                // TODO: Plumb from server-side variables via actions_lockfile_propagate_dependencies.
+                // Defaulted to true for development; should default to false once wired to server flag.
+                // When enabled, action refs are pinned to lockfile SHAs and enforcement is always on —
+                // any repository action without a matching lockfile entry fails the job.
+                // In practice, enforcement also happens upstream (run-service/launch); this is a safeguard.
+                public static readonly string UseDependencyPins = "actions_use_dependency_pins";
             }
 
             // Node version migration related constants
