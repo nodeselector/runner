@@ -36,4 +36,6 @@
     <DebugType>portable</DebugType>
   </PropertyGroup>
 
-</Project>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Test" />
+  </ItemGroup></Project>

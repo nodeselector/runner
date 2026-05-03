@@ -944,6 +944,53 @@ namespace GitHub.Runner.Worker
 
             ArgUtil.NotNull(actionDownloadInfos, nameof(actionDownloadInfos));
             ArgUtil.NotNull(actionDownloadInfos.Actions, nameof(actionDownloadInfos.Actions));
+
+            // If the job message contains system.actions.dependencies, verify ALL resolved
+            // actions have matching lockfile entries with correct SHAs.
+            var lockfileDeps = executionContext.Global.Variables.Get("system.actions.dependencies");
+            if (!string.IsNullOrEmpty(lockfileDeps))
+            {
+                executionContext.Output("Lockfile enforcement: verifying resolved action SHAs against dependencies");
+                var depEntries = ParseLockfileDependencies(lockfileDeps);
+
+                foreach (var action in actions)
+                {
+                    var repositoryReference = action.Reference as Pipelines.RepositoryPathReference;
+                    if (repositoryReference == null || string.IsNullOrEmpty(repositoryReference.Name))
+                        continue;
+                    if (string.Equals(repositoryReference.RepositoryType, Pipelines.PipelineConstants.SelfAlias, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    // Build key: owner/repo/path@ref (path included when present)
+                    var name = repositoryReference.Name;
+                    if (!string.IsNullOrEmpty(repositoryReference.Path))
+                        name = $"{name}/{repositoryReference.Path}";
+                    var key = $"{name}@{repositoryReference.Ref}";
+
+                    // Look up the resolved SHA from download info
+                    var lookupKey = GetDownloadInfoLookupKey(action);
+                    if (string.IsNullOrEmpty(lookupKey) || !actionDownloadInfos.Actions.TryGetValue(lookupKey, out var downloadInfo))
+                        continue;
+
+                    if (depEntries.TryGetValue(key, out var expectedSha))
+                    {
+                        if (!string.Equals(downloadInfo.ResolvedSha, expectedSha, StringComparison.OrdinalIgnoreCase))
+                        {
+                            var msg = $"LOCKFILE VIOLATION: {key} resolved to {downloadInfo.ResolvedSha} but lockfile expects {expectedSha}";
+                            executionContext.Error(msg);
+                            throw new InvalidOperationException(msg);
+                        }
+                        executionContext.Output($"  \u2713 {key} verified (SHA: {downloadInfo.ResolvedSha.Substring(0, 12)})");
+                    }
+                    else
+                    {
+                        var msg = $"LOCKFILE VIOLATION: {key} not found in dependencies section -- all actions must be pinned when lockfile is present";
+                        executionContext.Error(msg);
+                        throw new InvalidOperationException(msg);
+                    }
+                }
+            }
+
             var defaultAccessToken = executionContext.GetGitHubContext("token");
 
             foreach (var actionDownloadInfo in actionDownloadInfos.Actions.Values)
@@ -1513,6 +1560,45 @@ namespace GitHub.Runner.Worker
 
             ArgUtil.NotNullOrEmpty(archiveFile, nameof(archiveFile));
             executionContext.Debug($"Download '{downloadUrl}' to '{archiveFile}'");
+        }
+
+        /// <summary>
+        /// Parse lockfile dependency entries from the system.actions.dependencies variable.
+        /// Format: ["owner/repo@ref:sha1-HASH", "owner/repo/path@ref:sha1-HASH", ...]
+        /// Returns a map of "owner/repo@ref" or "owner/repo/path@ref" -> "HASH".
+        /// </summary>
+        internal static Dictionary<string, string> ParseLockfileDependencies(string json)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrEmpty(json)) return result;
+
+            // Simple JSON array parse -- entries are strings
+            var entries = StringUtil.ConvertFromJson<string[]>(json);
+            if (entries == null) return result;
+
+            foreach (var entry in entries)
+            {
+                // Format: owner/repo@ref:sha1-HASH or owner/repo/path@ref:sha1-HASH
+                // Also accepts legacy github.com/ prefix for backward compatibility
+                var colonIdx = entry.LastIndexOf(':');
+                if (colonIdx < 0) continue;
+
+                var key = entry.Substring(0, colonIdx);
+                if (key.StartsWith("github.com/"))
+                    key = key.Substring("github.com/".Length);
+                var shaSpec = entry.Substring(colonIdx + 1);
+
+                // Strip the hash algorithm prefix
+                var dashIdx = shaSpec.IndexOf('-');
+                var sha = dashIdx >= 0 ? shaSpec.Substring(dashIdx + 1) : shaSpec;
+
+                if (!string.IsNullOrEmpty(key) && !string.IsNullOrEmpty(sha))
+                {
+                    result[key] = sha;
+                }
+            }
+
+            return result;
         }
     }
 

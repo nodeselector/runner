@@ -283,6 +283,16 @@ namespace GitHub.DistributedTask.Pipelines
         }
 
         /// <summary>
+        /// Pinned action dependency entries from the workflow's dependencies: section.
+        /// Each entry is "owner/repo@ref:sha1-HASH" or "owner/repo/path@ref:sha1-HASH".
+        /// </summary>
+        public IList<String> Dependencies
+        {
+            get;
+            set;
+        }
+
+        /// <summary>
         /// Gets the collection of variables associated with the current context.
         /// </summary>
         public IDictionary<String, VariableValue> Variables
